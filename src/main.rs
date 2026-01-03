@@ -1,10 +1,14 @@
-use std::collections::HashSet;
-use std::net::{Ipv4Addr, Ipv6Addr, UdpSocket};
-use std::time::Duration;
+use std::collections::{HashMap, HashSet};
+use std::io::{Read as IoRead, Write};
+use std::net::{Ipv4Addr, Ipv6Addr, TcpStream, UdpSocket};
+use std::sync::{Arc, Mutex, RwLock};
+use std::thread;
+use std::time::{Duration, Instant};
 
 const TIMEOUT_MS: u64 = 2000;
 const MAX_RETRIES: u32 = 2;
 const MAX_RECURSION_DEPTH: u32 = 20;
+const CACHE_CLEANUP_INTERVAL_SECS: u64 = 60;
 
 const ROOT_SERVERS: &[&str] = &[
     "198.41.0.4",     // a.root-servers.net
@@ -13,6 +17,33 @@ const ROOT_SERVERS: &[&str] = &[
     "199.7.91.13",    // d.root-servers.net
     "192.203.230.10", // e.root-servers.net
 ];
+
+#[derive(Debug, Clone)]
+struct CacheEntry {
+    records: Vec<DnsRecord>,
+    inserted_at: Instant,
+    min_ttl: u32,
+}
+
+impl CacheEntry {
+    fn is_expired(&self) -> bool {
+        self.inserted_at.elapsed().as_secs() >= self.min_ttl as u64
+    }
+
+    fn adjust_ttls(&self) -> Vec<DnsRecord> {
+        let elapsed = self.inserted_at.elapsed().as_secs() as u32;
+        self.records
+            .iter()
+            .map(|r| {
+                let mut record = r.clone();
+                record.ttl = record.ttl.saturating_sub(elapsed);
+                record
+            })
+            .collect()
+    }
+}
+
+type DnsCache = Arc<RwLock<HashMap<String, CacheEntry>>>;
 
 #[derive(Debug)]
 struct DnsHeader {
@@ -299,11 +330,17 @@ fn parse_packet(data: &[u8]) -> DnsPacket {
 
     let mut answers = Vec::new();
     for _ in 0..header.answers {
+        if offset >= data.len() {
+            break;
+        }
         answers.push(parse_record(data, &mut offset));
     }
 
     let mut authority = Vec::new();
     for _ in 0..header.authority {
+        if offset >= data.len() {
+            break;
+        }
         authority.push(parse_record(data, &mut offset));
     }
 
@@ -324,33 +361,85 @@ fn parse_packet(data: &[u8]) -> DnsPacket {
     }
 }
 
+fn generate_transaction_id() -> u16 {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    let state = RandomState::new();
+    let mut hasher = state.build_hasher();
+    hasher.write_u64(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64,
+    );
+    hasher.finish() as u16
+}
+
 fn build_query(name: &str, qtype: u16, transaction_id: u16) -> Vec<u8> {
     let mut packet = Vec::new();
 
-    // Header
     packet.extend_from_slice(&transaction_id.to_be_bytes());
-    packet.extend_from_slice(&0x0100u16.to_be_bytes()); // RD=1 (recursion desired, though servers may ignore)
+    packet.extend_from_slice(&0x0100u16.to_be_bytes()); // RD=1
     packet.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
     packet.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT
     packet.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
     packet.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
 
-    // Question section - encode name
     for label in name.split('.') {
         if !label.is_empty() {
             packet.push(label.len() as u8);
             packet.extend_from_slice(label.as_bytes());
         }
     }
-    packet.push(0); // Root label
+    packet.push(0);
 
-    packet.extend_from_slice(&qtype.to_be_bytes()); // QTYPE
+    packet.extend_from_slice(&qtype.to_be_bytes());
     packet.extend_from_slice(&1u16.to_be_bytes()); // QCLASS = IN
 
     packet
 }
 
-fn send_query(server_ip: &str, query: &[u8]) -> Result<DnsPacket, String> {
+fn is_truncated(packet: &DnsPacket) -> bool {
+    (packet.header.flags & 0x0200) != 0
+}
+
+fn send_query_tcp(server_ip: &str, query: &[u8]) -> Result<DnsPacket, String> {
+    let server_addr = format!("{}:53", server_ip);
+    let mut stream =
+        TcpStream::connect_timeout(&server_addr.parse().unwrap(), Duration::from_millis(TIMEOUT_MS))
+            .map_err(|e| format!("TCP connect failed: {}", e))?;
+
+    stream
+        .set_read_timeout(Some(Duration::from_millis(TIMEOUT_MS)))
+        .map_err(|e| format!("set timeout failed: {}", e))?;
+
+    let len = query.len() as u16;
+    stream
+        .write_all(&len.to_be_bytes())
+        .map_err(|e| format!("TCP write length failed: {}", e))?;
+    stream
+        .write_all(query)
+        .map_err(|e| format!("TCP write query failed: {}", e))?;
+
+    let mut len_buf = [0u8; 2];
+    stream
+        .read_exact(&mut len_buf)
+        .map_err(|e| format!("TCP read length failed: {}", e))?;
+    let response_len = u16::from_be_bytes(len_buf) as usize;
+
+    let mut response_buf = vec![0u8; response_len];
+    stream
+        .read_exact(&mut response_buf)
+        .map_err(|e| format!("TCP read response failed: {}", e))?;
+
+    Ok(parse_packet(&response_buf))
+}
+
+fn send_query_udp(
+    server_ip: &str,
+    query: &[u8],
+    expected_txid: u16,
+) -> Result<(DnsPacket, bool), String> {
     let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("bind failed: {}", e))?;
     socket
         .set_read_timeout(Some(Duration::from_millis(TIMEOUT_MS)))
@@ -365,8 +454,27 @@ fn send_query(server_ip: &str, query: &[u8]) -> Result<DnsPacket, String> {
             .map_err(|e| format!("send failed: {}", e))?;
 
         match socket.recv_from(&mut response_buf) {
-            Ok((len, _)) => {
-                return Ok(parse_packet(&response_buf[..len]));
+            Ok((len, src)) => {
+                if !src.to_string().starts_with(server_ip) {
+                    continue;
+                }
+
+                if len < 12 {
+                    continue;
+                }
+
+                let received_txid = u16::from_be_bytes([response_buf[0], response_buf[1]]);
+                if received_txid != expected_txid {
+                    println!(
+                        "    WARNING: Transaction ID mismatch (expected {:04X}, got {:04X})",
+                        expected_txid, received_txid
+                    );
+                    continue;
+                }
+
+                let packet = parse_packet(&response_buf[..len]);
+                let truncated = is_truncated(&packet);
+                return Ok((packet, truncated));
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 if attempt < MAX_RETRIES {
@@ -382,6 +490,20 @@ fn send_query(server_ip: &str, query: &[u8]) -> Result<DnsPacket, String> {
     Err(format!("timeout querying {}", server_ip))
 }
 
+fn send_query(server_ip: &str, query: &[u8], expected_txid: u16) -> Result<DnsPacket, String> {
+    match send_query_udp(server_ip, query, expected_txid) {
+        Ok((packet, truncated)) => {
+            if truncated {
+                println!("    Response truncated, retrying with TCP...");
+                send_query_tcp(server_ip, query)
+            } else {
+                Ok(packet)
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
 fn get_rcode(packet: &DnsPacket) -> u16 {
     packet.header.flags & 0x000F
 }
@@ -390,11 +512,42 @@ fn is_authoritative(packet: &DnsPacket) -> bool {
     (packet.header.flags & 0x0400) != 0
 }
 
-fn find_glue_a(additional: &[DnsRecord], ns_name: &str) -> Option<Ipv4Addr> {
+fn is_in_bailiwick(ns_name: &str, zone: &str) -> bool {
+    let ns_lower = ns_name.to_lowercase();
+    let zone_lower = zone.to_lowercase();
+
+    if zone_lower.is_empty() {
+        return true;
+    }
+
+    ns_lower == zone_lower || ns_lower.ends_with(&format!(".{}", zone_lower))
+}
+
+fn find_glue_a(additional: &[DnsRecord], ns_name: &str, zone: &str) -> Option<Ipv4Addr> {
+    if !is_in_bailiwick(ns_name, zone) {
+        return None;
+    }
+
     let ns_lower = ns_name.to_lowercase();
     for record in additional {
         if record.rtype == 1 && record.name.to_lowercase() == ns_lower {
             if let RData::A(addr) = &record.rdata {
+                return Some(*addr);
+            }
+        }
+    }
+    None
+}
+
+fn find_glue_aaaa(additional: &[DnsRecord], ns_name: &str, zone: &str) -> Option<Ipv6Addr> {
+    if !is_in_bailiwick(ns_name, zone) {
+        return None;
+    }
+
+    let ns_lower = ns_name.to_lowercase();
+    for record in additional {
+        if record.rtype == 28 && record.name.to_lowercase() == ns_lower {
+            if let RData::AAAA(addr) = &record.rdata {
                 return Some(*addr);
             }
         }
@@ -414,6 +567,14 @@ fn extract_ns_names(authority: &[DnsRecord]) -> Vec<String> {
             None
         })
         .collect()
+}
+
+fn extract_zone_from_authority(authority: &[DnsRecord]) -> String {
+    authority
+        .iter()
+        .find(|r| r.rtype == 2)
+        .map(|r| r.name.clone())
+        .unwrap_or_default()
 }
 
 fn qtype_to_string(qtype: u16) -> &'static str {
@@ -472,6 +633,43 @@ fn print_record(record: &DnsRecord, section: &str) {
     );
 }
 
+fn cache_lookup(cache: &DnsCache, name: &str, qtype: u16) -> Option<Vec<DnsRecord>> {
+    let cache_key = format!("{}:{}", name.to_lowercase(), qtype);
+    let cache_read = cache.read().unwrap();
+    if let Some(entry) = cache_read.get(&cache_key) {
+        if !entry.is_expired() {
+            return Some(entry.adjust_ttls());
+        }
+    }
+    None
+}
+
+fn cache_insert(cache: &DnsCache, name: &str, qtype: u16, records: &[DnsRecord]) {
+    if records.is_empty() {
+        return;
+    }
+
+    let min_ttl = records.iter().map(|r| r.ttl).min().unwrap_or(300);
+    if min_ttl == 0 {
+        return;
+    }
+
+    let cache_key = format!("{}:{}", name.to_lowercase(), qtype);
+    let entry = CacheEntry {
+        records: records.to_vec(),
+        inserted_at: Instant::now(),
+        min_ttl,
+    };
+
+    let mut cache_write = cache.write().unwrap();
+    cache_write.insert(cache_key, entry);
+}
+
+fn cache_cleanup(cache: &DnsCache) {
+    let mut cache_write = cache.write().unwrap();
+    cache_write.retain(|_, entry| !entry.is_expired());
+}
+
 #[derive(Debug)]
 enum ResolveResult {
     Answer(Vec<DnsRecord>),
@@ -484,12 +682,26 @@ fn resolve_recursive(
     qtype: u16,
     depth: u32,
     resolving: &mut HashSet<String>,
+    cache: &DnsCache,
 ) -> ResolveResult {
     if depth > MAX_RECURSION_DEPTH {
         return ResolveResult::ServFail("max recursion depth exceeded".to_string());
     }
 
     let cache_key = format!("{}:{}", name.to_lowercase(), qtype);
+
+    if let Some(cached) = cache_lookup(cache, name, qtype) {
+        let indent = "  ".repeat(depth as usize);
+        println!(
+            "{}[depth={}] Cache hit for {} {}",
+            indent,
+            depth,
+            name,
+            qtype_to_string(qtype)
+        );
+        return ResolveResult::Answer(cached);
+    }
+
     if resolving.contains(&cache_key) {
         return ResolveResult::ServFail("loop detected".to_string());
     }
@@ -506,23 +718,19 @@ fn resolve_recursive(
 
     let mut servers: Vec<String> = ROOT_SERVERS.iter().map(|s| s.to_string()).collect();
     let mut server_label = "ROOT";
-
-    let transaction_id = (std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos()
-        & 0xFFFF) as u16;
-
-    let query = build_query(name, qtype, transaction_id);
+    let mut current_zone;
 
     loop {
+        let transaction_id = generate_transaction_id();
+        let query = build_query(name, qtype, transaction_id);
+
         let mut last_error = String::new();
         let mut response: Option<DnsPacket> = None;
 
         for server_ip in &servers {
             println!("{}  Querying {} ({})...", indent, server_ip, server_label);
 
-            match send_query(server_ip, &query) {
+            match send_query(server_ip, &query, transaction_id) {
                 Ok(packet) => {
                     response = Some(packet);
                     break;
@@ -561,12 +769,14 @@ fn resolve_recursive(
                 if answer.rtype == 5 && qtype != 5 {
                     if let RData::CNAME(cname) = &answer.rdata {
                         println!("{}  CNAME -> {}", indent, cname);
-                        let cname_result = resolve_recursive(cname, qtype, depth + 1, resolving);
+                        let cname_result =
+                            resolve_recursive(cname, qtype, depth + 1, resolving, cache);
                         resolving.remove(&cache_key);
                         return match cname_result {
                             ResolveResult::Answer(mut records) => {
                                 let mut full_answer = vec![answer.clone()];
                                 full_answer.append(&mut records);
+                                cache_insert(cache, name, qtype, &full_answer);
                                 ResolveResult::Answer(full_answer)
                             }
                             other => other,
@@ -584,12 +794,14 @@ fn resolve_recursive(
 
             if !matching.is_empty() {
                 println!("{}  Got {} answer(s)", indent, matching.len());
+                cache_insert(cache, name, qtype, &matching);
                 resolving.remove(&cache_key);
                 return ResolveResult::Answer(matching);
             }
         }
 
         let ns_names = extract_ns_names(&packet.authority);
+        current_zone = extract_zone_from_authority(&packet.authority);
 
         if ns_names.is_empty() {
             if is_authoritative(&packet) {
@@ -606,16 +818,19 @@ fn resolve_recursive(
         let mut next_servers: Vec<String> = Vec::new();
 
         for ns_name in &ns_names {
-            if let Some(ip) = find_glue_a(&packet.additional, ns_name) {
-                println!("{}    {} -> {} (glue)", indent, ns_name, ip);
+            if let Some(ip) = find_glue_a(&packet.additional, ns_name, &current_zone) {
+                println!("{}    {} -> {} (glue A)", indent, ns_name, ip);
                 next_servers.push(ip.to_string());
+            }
+            if let Some(ip) = find_glue_aaaa(&packet.additional, ns_name, &current_zone) {
+                println!("{}    {} -> {} (glue AAAA)", indent, ns_name, ip);
             }
         }
 
         if next_servers.is_empty() {
             for ns_name in ns_names.iter().take(2) {
                 println!("{}    Resolving NS: {}", indent, ns_name);
-                match resolve_recursive(ns_name, 1, depth + 1, resolving) {
+                match resolve_recursive(ns_name, 1, depth + 1, resolving, cache) {
                     ResolveResult::Answer(records) => {
                         for r in records {
                             if let RData::A(addr) = r.rdata {
@@ -651,16 +866,13 @@ fn build_response(original_query: &[u8], answers: &[DnsRecord], rcode: u16) -> V
         return response;
     }
 
-    // Set QR=1 (response), RD=1, RA=1
     response[2] = 0x81;
     response[3] = 0x80 | (rcode as u8 & 0x0F);
 
-    // Update answer count
     let ancount = answers.len() as u16;
     response[6] = (ancount >> 8) as u8;
     response[7] = (ancount & 0xFF) as u8;
 
-    // Clear authority and additional
     response[8] = 0;
     response[9] = 0;
     response[10] = 0;
@@ -679,7 +891,6 @@ fn build_response(original_query: &[u8], answers: &[DnsRecord], rcode: u16) -> V
         response.extend_from_slice(&record.rclass.to_be_bytes());
         response.extend_from_slice(&record.ttl.to_be_bytes());
 
-        // RDATA
         match &record.rdata {
             RData::A(addr) => {
                 response.extend_from_slice(&4u16.to_be_bytes());
@@ -737,10 +948,76 @@ fn build_response(original_query: &[u8], answers: &[DnsRecord], rcode: u16) -> V
     response
 }
 
+fn handle_query(
+    query_data: Vec<u8>,
+    src: std::net::SocketAddr,
+    socket: Arc<UdpSocket>,
+    cache: DnsCache,
+) {
+    let query_packet = parse_packet(&query_data);
+
+    println!(
+        "Transaction ID: 0x{:04X}",
+        query_packet.header.transaction_id
+    );
+
+    for question in &query_packet.questions {
+        println!(
+            "Query: {} {} class={}",
+            question.name,
+            qtype_to_string(question.qtype),
+            question.qclass
+        );
+
+        let mut resolving = HashSet::new();
+        let result =
+            resolve_recursive(&question.name, question.qtype, 0, &mut resolving, &cache);
+
+        match result {
+            ResolveResult::Answer(records) => {
+                println!("\n=== FINAL ANSWER ===");
+                for record in &records {
+                    print_record(record, "ANSWER");
+                }
+
+                let response = build_response(&query_data, &records, 0);
+                if let Err(e) = socket.send_to(&response, src) {
+                    println!("Failed to send response: {}", e);
+                } else {
+                    println!("Sent {} bytes to client", response.len());
+                }
+            }
+            ResolveResult::NxDomain => {
+                println!("\n=== NXDOMAIN ===");
+                let response = build_response(&query_data, &[], 3);
+                let _ = socket.send_to(&response, src);
+            }
+            ResolveResult::ServFail(err) => {
+                println!("\n=== SERVFAIL: {} ===", err);
+                let response = build_response(&query_data, &[], 2);
+                let _ = socket.send_to(&response, src);
+            }
+        }
+    }
+}
+
 fn main() -> std::io::Result<()> {
-    let socket = UdpSocket::bind("127.0.0.1:2100")?;
+    let socket = Arc::new(UdpSocket::bind("127.0.0.1:2100")?);
+    let cache: DnsCache = Arc::new(RwLock::new(HashMap::new()));
+
     println!("DNS recursive resolver listening on 127.0.0.1:2100");
     println!("Using {} root servers", ROOT_SERVERS.len());
+    println!("Features: TTL cache, TCP fallback, bailiwick checking, txid validation");
+
+    let cleanup_cache = Arc::clone(&cache);
+    thread::spawn(move || loop {
+        thread::sleep(Duration::from_secs(CACHE_CLEANUP_INTERVAL_SECS));
+        cache_cleanup(&cleanup_cache);
+        let cache_read = cleanup_cache.read().unwrap();
+        println!("[Cache] {} entries after cleanup", cache_read.len());
+    });
+
+    let pending_queries: Arc<Mutex<HashSet<u16>>> = Arc::new(Mutex::new(HashSet::new()));
 
     let mut buf = [0u8; 512];
     loop {
@@ -748,46 +1025,29 @@ fn main() -> std::io::Result<()> {
         println!("\n{}", "=".repeat(60));
         println!("Received {} bytes from {}", len, src);
 
-        let query_packet = parse_packet(&buf[..len]);
+        let query_data = buf[..len].to_vec();
+        let socket_clone = Arc::clone(&socket);
+        let cache_clone = Arc::clone(&cache);
+        let pending_clone = Arc::clone(&pending_queries);
 
-        println!(
-            "Transaction ID: 0x{:04X}",
-            query_packet.header.transaction_id
-        );
-
-        for question in &query_packet.questions {
-            println!(
-                "Query: {} {} class={}",
-                question.name,
-                qtype_to_string(question.qtype),
-                question.qclass
-            );
-
-            let mut resolving = HashSet::new();
-            let result = resolve_recursive(&question.name, question.qtype, 0, &mut resolving);
-
-            match result {
-                ResolveResult::Answer(records) => {
-                    println!("\n=== FINAL ANSWER ===");
-                    for record in &records {
-                        print_record(record, "ANSWER");
-                    }
-
-                    let response = build_response(&buf[..len], &records, 0);
-                    socket.send_to(&response, src)?;
-                    println!("Sent {} bytes to client", response.len());
-                }
-                ResolveResult::NxDomain => {
-                    println!("\n=== NXDOMAIN ===");
-                    let response = build_response(&buf[..len], &[], 3);
-                    socket.send_to(&response, src)?;
-                }
-                ResolveResult::ServFail(err) => {
-                    println!("\n=== SERVFAIL: {} ===", err);
-                    let response = build_response(&buf[..len], &[], 2);
-                    socket.send_to(&response, src)?;
-                }
+        if len >= 2 {
+            let txid = u16::from_be_bytes([query_data[0], query_data[1]]);
+            let mut pending = pending_clone.lock().unwrap();
+            if pending.contains(&txid) {
+                println!("Duplicate query (txid {:04X}), ignoring", txid);
+                continue;
             }
+            pending.insert(txid);
         }
+
+        thread::spawn(move || {
+            handle_query(query_data.clone(), src, socket_clone, cache_clone);
+
+            if query_data.len() >= 2 {
+                let txid = u16::from_be_bytes([query_data[0], query_data[1]]);
+                let mut pending = pending_clone.lock().unwrap();
+                pending.remove(&txid);
+            }
+        });
     }
 }
